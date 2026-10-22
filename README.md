@@ -697,6 +697,7 @@ O identificador `:chatId` é o JID do WhatsApp (por exemplo, `5511999999999@s.wh
 - **Um computador.** Se ele desligar, suspender ou perder a internet, o painel e a IA param. Não há hospedagem em nuvem.
 - **Sem transcrição de áudio, OCR ou leitura de PDF.** A IA recebe apenas texto, legendas e avisos de mídia.
 - **Histórico limitado.** Depende do que o WhatsApp envia, fica em 3.000 mensagens por conversa e a interface mostra 300.
+- **Mídias antigas.** Áudios, imagens, vídeos e documentos recebidos antes desta versão não guardam as chaves de descriptografia do WhatsApp. Eles aparecem como “não baixados” e só podem ser recuperados com uma nova sincronização/pareamento. Mídias novas são baixadas automaticamente, até 25 MB.
 - **Logs da IA em memória.** São perdidos ao reiniciar; não há exportação nem relatórios.
 - **Limites em memória.** Os contadores de resposta por hora zeram ao reiniciar o servidor.
 - **Um arquivo por envio**, até 25 MB. Não há encaminhamento, resposta em thread ou edição de mensagens.
