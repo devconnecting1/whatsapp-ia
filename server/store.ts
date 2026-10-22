@@ -30,6 +30,8 @@ interface StoredContact {
   id: string;
   name?: string;
   notify?: string;
+  lid?: string;
+  jid?: string;
 }
 
 interface Database {
@@ -37,6 +39,7 @@ interface Database {
   chats: Record<string, StoredChat>;
   chatSettings: Record<string, StoredChatSettings>;
   contacts: Record<string, StoredContact>;
+  lidToPhone?: Record<string, string>;
 }
 
 interface StoredSettings {
@@ -101,7 +104,7 @@ function safeFileName(id: string): string {
 }
 
 function emptyDb(): Database {
-  return { version: 1, chats: {}, chatSettings: {}, contacts: {} };
+  return { version: 1, chats: {}, chatSettings: {}, contacts: {}, lidToPhone: {} };
 }
 
 export function normalizePhoneJid(jid: string): string {
@@ -109,8 +112,26 @@ export function normalizePhoneJid(jid: string): string {
   return user.replace(/[^0-9]/g, '');
 }
 
+function isPlaceholderName(name: string): boolean {
+  return /^\+?\d{10,}$/.test(name.trim()) || name === 'Contato não salvo' || name === 'Sem nome';
+}
+
+export function isVisibleChat(chat: ChatSummary): boolean {
+  if (
+    chat.id.endsWith('@newsletter') ||
+    chat.id.endsWith('@broadcast') ||
+    chat.id === 'status@broadcast' ||
+    chat.id === '0@s.whatsapp.net'
+  ) {
+    return false;
+  }
+  return chat.lastMessageAt > 0 || chat.lastMessage.trim().length > 0;
+}
+
 export function fallbackNameForJid(jid: string): string {
   if (jid.endsWith('@g.us')) return 'Grupo';
+  if (jid.endsWith('@newsletter')) return 'Canal';
+  if (jid.endsWith('@lid')) return 'Contato não salvo';
   if (jid.endsWith('@broadcast')) return 'Transmissão';
   const digits = normalizePhoneJid(jid);
   if (!digits) return jid;
@@ -137,6 +158,8 @@ export class Store {
     this.db.chats ??= {};
     this.db.chatSettings ??= {};
     this.db.contacts ??= {};
+    this.db.lidToPhone ??= {};
+    this.normalizeChatNames();
     this.settings = { ...DEFAULT_SETTINGS, ...readJson<Partial<StoredSettings>>(SETTINGS_FILE, {}) };
   }
 
@@ -235,12 +258,80 @@ export class Store {
     const q = query?.trim().toLowerCase();
     const chats = Object.values(this.db.chats)
       .map(chat => this.toSummary(chat))
+      .filter(isVisibleChat)
+      .filter(chat => chat.lastMessage.trim().length > 0 || this.getMessages(chat.id).length > 0)
       .filter(chat => (q ? chat.name.toLowerCase().includes(q) || chat.lastMessage.toLowerCase().includes(q) : true))
       .sort((a, b) => {
         if (a.pinned !== b.pinned) return a.pinned ? -1 : 1;
         return b.lastMessageAt - a.lastMessageAt;
       });
     return chats;
+  }
+
+  resolveLidPhone(chatId: string): string | null {
+    if (!chatId.endsWith('@lid')) return null;
+    return this.db.lidToPhone?.[chatId] ?? null;
+  }
+
+  getPhoneContactIds(): string[] {
+    return Object.keys(this.db.contacts).filter(
+      id => id.endsWith('@s.whatsapp.net') && normalizePhoneJid(id).length >= 8,
+    );
+  }
+
+  private contactNameFor(chatId: string): string | undefined {
+    const direct = this.db.contacts[chatId];
+    const phone = this.resolveLidPhone(chatId);
+    const mapped = phone ? this.db.contacts[phone] : undefined;
+    const directName = direct?.name && !isPlaceholderName(direct.name) ? direct.name : undefined;
+    const mappedName = mapped?.name && !isPlaceholderName(mapped.name) ? mapped.name : undefined;
+    // Nome salvo na agenda sempre vence o pushName.
+    return directName || mappedName || direct?.notify || mapped?.notify;
+  }
+
+  private refreshChatName(chatId: string): void {
+    const chat = this.db.chats[chatId];
+    if (!chat || chat.isGroup) return;
+
+    const contactName = this.contactNameFor(chatId);
+    const phone = this.resolveLidPhone(chatId);
+    const fallback = fallbackNameForJid(phone ?? chatId);
+    let nextName = chat.name;
+
+    if (contactName) nextName = contactName;
+    else if (isPlaceholderName(chat.name)) nextName = fallback;
+
+    if (nextName !== chat.name) {
+      chat.name = nextName;
+      bus.emit('chat', this.toSummary(chat));
+      this.scheduleDbSave();
+    }
+  }
+
+  private normalizeChatNames(): void {
+    for (const chat of Object.values(this.db.chats)) {
+      if (chat.isGroup || chat.id.endsWith('@newsletter') || chat.id.endsWith('@broadcast')) continue;
+      const contactName = this.contactNameFor(chat.id);
+      const phone = this.resolveLidPhone(chat.id);
+      if (contactName) {
+        chat.name = contactName;
+      } else if (isPlaceholderName(chat.name)) {
+        chat.name = fallbackNameForJid(phone ?? chat.id);
+      }
+    }
+  }
+
+  linkLid(lid: string, phoneJid: string): void {
+    if (!lid.endsWith('@lid')) return;
+    const normalized = phoneJid.split('@')[0]?.split(':')[0];
+    if (!normalized || normalized.length < 8) return;
+    const phone = `${normalized}@s.whatsapp.net`;
+    if (this.db.lidToPhone?.[lid] === phone) return;
+
+    this.db.lidToPhone ??= {};
+    this.db.lidToPhone[lid] = phone;
+    this.refreshChatName(lid);
+    this.scheduleDbSave();
   }
 
   upsertChat(input: {
@@ -256,10 +347,17 @@ export class Store {
   }): ChatSummary {
     const existing = this.db.chats[input.id];
     const isGroup = input.isGroup ?? existing?.isGroup ?? input.id.endsWith('@g.us');
-    const contact = this.db.contacts[input.id];
-    const fallback = fallbackNameForJid(input.id);
-    const contactName = contact?.name || contact?.notify;
-    const name = input.name || contactName || existing?.name || fallback;
+    const contactName = this.contactNameFor(input.id);
+    const phone = this.resolveLidPhone(input.id);
+    const fallback = fallbackNameForJid(phone ?? input.id);
+    const inputName = input.name?.trim();
+    const existingName = existing?.name && !isPlaceholderName(existing.name) ? existing.name : undefined;
+
+    const name = isGroup
+      ? inputName || existingName || contactName || fallback
+      : inputName && !isPlaceholderName(inputName)
+        ? inputName
+        : contactName || existingName || fallback;
 
     const chat: StoredChat = existing ?? {
       id: input.id,
@@ -350,22 +448,38 @@ export class Store {
     return new Map(Object.values(this.db.chats).map(chat => [chat.id, chat.name]));
   }
 
-  upsertContact(id: string, data: { name?: string; notify?: string }): void {
+  upsertContact(
+    id: string,
+    data: { name?: string; notify?: string; lid?: string; jid?: string },
+  ): void {
     const existing = this.db.contacts[id] ?? { id };
     if (data.name) existing.name = data.name;
     if (data.notify) existing.notify = data.notify;
+    if (data.lid?.endsWith('@lid')) existing.lid = data.lid;
+    if (data.jid?.endsWith('@s.whatsapp.net')) existing.jid = data.jid;
     this.db.contacts[id] = existing;
 
-    const chat = this.db.chats[id];
-    if (chat && !chat.isGroup) {
-      const newName = existing.name || existing.notify;
-      const fallback = fallbackNameForJid(id);
-      // O nome da agenda (name) tem prioridade; o pushName só preenche nomes provisórios.
-      if (newName && (chat.name === fallback || !chat.name || (chat.name === data.notify && existing.name))) {
-        if (chat.name !== newName) {
-          chat.name = newName;
-          bus.emit('chat', this.toSummary(chat));
-        }
+    const lid =
+      id.endsWith('@lid')
+        ? id
+        : data.lid?.endsWith('@lid')
+          ? data.lid
+          : undefined;
+    const jid =
+      id.endsWith('@s.whatsapp.net')
+        ? id
+        : data.jid?.endsWith('@s.whatsapp.net')
+          ? data.jid
+          : undefined;
+
+    if (lid && jid) {
+      this.linkLid(lid, jid);
+    } else if (lid) {
+      this.refreshChatName(lid);
+    } else {
+      this.refreshChatName(id);
+      for (const [mappedLid, mappedPhone] of Object.entries(this.db.lidToPhone ?? {})) {
+        if (mappedPhone === id) this.refreshChatName(mappedLid);
       }
     }
     this.scheduleDbSave();

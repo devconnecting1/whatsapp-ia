@@ -174,6 +174,7 @@ export function useWhatsApp(): UseWhatsAppResult {
   const chatsRef = useRef<ChatSummary[]>([]);
   const activeChatIdRef = useRef<string | null>(null);
   const restoredChatRef = useRef(false);
+  const loadedChatIdRef = useRef<string | null>(null);
 
   const chatsEpochRef = useRef(0);
   const chatsRequestRef = useRef(0);
@@ -301,6 +302,24 @@ export function useWhatsApp(): UseWhatsAppResult {
     setAiLogs(previous => mergeAiLogs(logs, previous));
   }, []);
 
+  /**
+   * Recarrega as mensagens da conversa aberta sem exibir o skeleton e sem
+   * mexer na posição de rolagem. Usado ao terminar a sincronização inicial.
+   */
+  const refreshActiveMessages = useCallback(async () => {
+    const chatId = activeChatIdRef.current;
+    if (!chatId || loadingChatIdRef.current === chatId) return;
+
+    try {
+      const list = await api.getMessages(chatId, MESSAGES_LIMIT);
+      if (activeChatIdRef.current !== chatId) return;
+      setMessages(previous => mergeMessages(list, previous));
+      loadedChatIdRef.current = chatId;
+    } catch (error) {
+      console.error('[useWhatsApp] falha ao atualizar mensagens', error);
+    }
+  }, []);
+
   const applyStatus = useCallback(
     (next: Status) => {
       const previous = statusRef.current;
@@ -399,12 +418,25 @@ export function useWhatsApp(): UseWhatsAppResult {
       if (!chatId) {
         messagesRequestRef.current += 1;
         loadingChatIdRef.current = null;
+        loadedChatIdRef.current = null;
         setMessages([]);
         setLoadingMessages(false);
         return;
       }
 
-      if (previousId !== chatId) setMessages([]);
+      // Clicar na conversa que já está aberta não deve recarregar nem piscar
+      // o skeleton. Uma nova carga só acontece ao trocar de conversa.
+      if (
+        previousId === chatId &&
+        (loadedChatIdRef.current === chatId || loadingChatIdRef.current === chatId)
+      ) {
+        return;
+      }
+
+      if (previousId !== chatId) {
+        loadedChatIdRef.current = null;
+        setMessages([]);
+      }
 
       // Limpa o contador local e confirma a leitura no servidor.
       const currentChat = chatsRef.current.find(chat => chat.id === chatId);
@@ -431,6 +463,7 @@ export function useWhatsApp(): UseWhatsAppResult {
         const list = await api.getMessages(chatId, MESSAGES_LIMIT);
         if (activeChatIdRef.current !== chatId || messagesRequestRef.current !== requestId) return;
         setMessages(previous => mergeMessages(list, previous));
+        loadedChatIdRef.current = chatId;
       } catch (error) {
         if (activeChatIdRef.current === chatId && messagesRequestRef.current === requestId) {
           console.error('[useWhatsApp] falha ao carregar mensagens', error);
@@ -533,6 +566,7 @@ export function useWhatsApp(): UseWhatsAppResult {
     chatsLoadsRef.current = 0;
     messagesRequestRef.current += 1;
     loadingChatIdRef.current = null;
+    loadedChatIdRef.current = null;
 
     const nextStatus = disconnectedStatus();
     statusRef.current = nextStatus;
@@ -618,11 +652,11 @@ export function useWhatsApp(): UseWhatsAppResult {
       listenSse<Message>(source, 'message', applyMessage),
       listenSse<Message>(source, 'message-update', applyMessageUpdate),
       listenSse<AiLogEntry>(source, 'ai-log', applyAiLog),
-      // Fim da sincronização inicial: recarrega a lista e a conversa aberta.
+      // Fim da sincronização inicial: atualiza a lista e as mensagens da
+      // conversa aberta em segundo plano, sem reiniciar o carregamento visual.
       listenSse<{ ok: boolean }>(source, 'sync-complete', () => {
         void refreshChats().catch(() => {});
-        const active = activeChatIdRef.current;
-        if (active) void selectChat(active);
+        void refreshActiveMessages();
       }),
     ];
 
@@ -643,6 +677,7 @@ export function useWhatsApp(): UseWhatsAppResult {
     applyMessageUpdate,
     applySettings,
     applyStatus,
+    refreshActiveMessages,
     refreshChats,
     refreshStatus,
     selectChat,

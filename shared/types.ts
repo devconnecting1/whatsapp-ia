@@ -41,7 +41,7 @@ export interface MediaInfo {
   kind: MediaKind;
   mime: string;
   fileName?: string;
-  url: string;
+  url?: string;
   size?: number;
 }
 

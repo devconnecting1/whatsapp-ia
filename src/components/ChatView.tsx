@@ -73,7 +73,9 @@ export function ChatView({
   className,
 }: ChatViewProps) {
   const scrollRef = useRef<HTMLDivElement>(null);
+  const contentRef = useRef<HTMLDivElement>(null);
   const previousChatId = useRef<string | null>(null);
+  const stickToBottomRef = useRef(true);
   const connected = status?.state === 'connected';
   const paused = Boolean(chat?.pausedUntil && chat.pausedUntil > Date.now());
 
@@ -82,16 +84,54 @@ export function ChatView({
     if (!element) return;
     const chatChanged = previousChatId.current !== (chat?.id ?? null);
     previousChatId.current = chat?.id ?? null;
-    if (chatChanged) {
-      element.scrollTop = element.scrollHeight;
+    if (chatChanged) stickToBottomRef.current = true;
+
+    // Enquanto o histórico carrega, o skeleton ocupa pouco espaço. Marca que
+    // devemos descer quando as mensagens reais aparecerem.
+    if (loading) {
+      stickToBottomRef.current = true;
       return;
     }
+
     const last = messages[messages.length - 1];
     const nearBottom = element.scrollHeight - element.scrollTop - element.clientHeight < 240;
-    if (nearBottom || last?.fromMe) {
+    if (chatChanged || stickToBottomRef.current || nearBottom || last?.fromMe) {
+      // O navegador ajusta a altura depois da pintura (fonte, separadores e
+      // quebras de linha). Repetimos no próximo frame para encostar de fato
+      // na última mensagem.
       element.scrollTop = element.scrollHeight;
+      const frame = requestAnimationFrame(() => {
+        element.scrollTop = element.scrollHeight;
+      });
+      const timer = window.setTimeout(() => {
+        element.scrollTop = element.scrollHeight;
+      }, 120);
+      return () => {
+        cancelAnimationFrame(frame);
+        clearTimeout(timer);
+      };
     }
-  }, [messages, chat?.id]);
+  }, [messages, chat?.id, loading]);
+
+  const handleScroll = () => {
+    const element = scrollRef.current;
+    if (!element) return;
+    stickToBottomRef.current = element.scrollHeight - element.scrollTop - element.clientHeight < 60;
+  };
+
+  useEffect(() => {
+    const content = contentRef.current;
+    const scroller = scrollRef.current;
+    if (!content || !scroller) return;
+
+    // A fonte e os separadores mudam a altura depois da primeira pintura.
+    // Enquanto o usuário estiver no fim, acompanhamos qualquer crescimento.
+    const observer = new ResizeObserver(() => {
+      if (stickToBottomRef.current) scroller.scrollTop = scroller.scrollHeight;
+    });
+    observer.observe(content);
+    return () => observer.disconnect();
+  }, [chat?.id]);
 
   if (!chat) {
     return (
@@ -214,14 +254,15 @@ export function ChatView({
 
       <div
         ref={scrollRef}
-        className="relative min-h-0 flex-1 overflow-y-auto px-2 py-2 md:px-6"
+        onScroll={handleScroll}
+        className="relative min-h-0 flex-1 overflow-y-auto overflow-x-hidden overscroll-contain px-2 py-2 md:px-6"
         style={{
           backgroundImage:
             'radial-gradient(circle at 1px 1px, rgba(17,27,33,0.10) 1px, transparent 0)',
           backgroundSize: '26px 26px',
         }}
       >
-        <div className="mx-auto flex w-full max-w-[900px] flex-col">
+        <div ref={contentRef} className="mx-auto flex w-full max-w-[900px] flex-col gap-1.5">
           {loading ? (
             <MessagesSkeleton />
           ) : messages.length === 0 ? (

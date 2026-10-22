@@ -30,6 +30,7 @@ import { bus } from './bus';
 import {
   Store,
   fallbackNameForJid,
+  isVisibleChat,
   normalizePhoneJid,
 } from './store';
 
@@ -187,10 +188,14 @@ export class WhatsAppManager {
   private connectedAt: number | null = null;
   private lastError: string | null = null;
   private sync: SyncProgress | null = null;
+  private syncTimer: ReturnType<typeof setTimeout> | null = null;
+  private syncSequence = 0;
   private starting = false;
   private stopped = true;
   private generation = 0;
   private reconnectTimer: NodeJS.Timeout | null = null;
+  private lidSyncTimer: NodeJS.Timeout | null = null;
+  private lidSyncStarted = false;
 
   onInbound?: (chatId: string) => void;
 
@@ -213,7 +218,7 @@ export class WhatsAppManager {
   }
 
   private emitChat(chat: ChatSummary | null): void {
-    if (chat) bus.emit('chat', chat);
+    if (chat && isVisibleChat(chat)) bus.emit('chat', chat);
   }
 
   private emitMessage(message: Message): void {
@@ -264,7 +269,9 @@ export class WhatsAppManager {
         auth: state,
         logger,
         printQRInTerminal: false,
-        browser: Browsers.macOS('Desktop'),
+        // Ubuntu/Chrome anuncia webSubPlatform=WEB_BROWSER. O WhatsApp está
+        // rejeitando Desktop (DARWIN/WIN32) com 428 antes de emitir o QR.
+        browser: Browsers.ubuntu('Chrome'),
         syncFullHistory: SYNC_FULL_HISTORY,
         markOnlineOnConnect: false,
         generateHighQualityLinkPreview: false,
@@ -313,16 +320,33 @@ export class WhatsAppManager {
         if (generation !== this.generation) return;
         for (const contact of contacts) {
           if (!contact.id) continue;
-          this.store.upsertContact(contact.id, { name: contact.name ?? undefined, notify: contact.notify ?? undefined });
+          this.store.upsertContact(contact.id, {
+            name: contact.name ?? undefined,
+            notify: contact.notify ?? undefined,
+            lid: contact.lid ?? undefined,
+            jid: contact.jid ?? undefined,
+          });
         }
+        this.scheduleLidSync(2500);
       });
 
       sock.ev.on('contacts.update', contacts => {
         if (generation !== this.generation) return;
         for (const contact of contacts) {
           if (!contact.id) continue;
-          this.store.upsertContact(contact.id, { name: contact.name ?? undefined, notify: contact.notify ?? undefined });
+          this.store.upsertContact(contact.id, {
+            name: contact.name ?? undefined,
+            notify: contact.notify ?? undefined,
+            lid: contact.lid ?? undefined,
+            jid: contact.jid ?? undefined,
+          });
         }
+        this.scheduleLidSync(2500);
+      });
+
+      sock.ev.on('chats.phoneNumberShare', ({ lid, jid }) => {
+        if (generation !== this.generation) return;
+        this.store.linkLid(lid, jid);
       });
 
       sock.ev.on('groups.update', groups => {
@@ -386,6 +410,8 @@ export class WhatsAppManager {
       console.log(`[whatsapp] conectado como ${this.me.name} (${this.me.number})`);
       this.emitStatus();
       this.emitAllChats();
+      this.lidSyncStarted = false;
+      this.scheduleLidSync(1800);
     }
 
     if (update.connection === 'close') {
@@ -401,6 +427,16 @@ export class WhatsAppManager {
       this.connectedAt = null;
       this.qr = null;
       this.sync = null;
+      this.syncSequence += 1;
+      this.lidSyncStarted = false;
+      if (this.lidSyncTimer) {
+        clearTimeout(this.lidSyncTimer);
+        this.lidSyncTimer = null;
+      }
+      if (this.syncTimer) {
+        clearTimeout(this.syncTimer);
+        this.syncTimer = null;
+      }
 
       if (loggedOut) {
         this.state = 'disconnected';
@@ -433,6 +469,58 @@ export class WhatsAppManager {
     for (const chat of this.store.listChats()) bus.emit('chat', chat);
   }
 
+  private scheduleLidSync(delayMs: number): void {
+    if (this.lidSyncStarted || this.lidSyncTimer) return;
+    const sock = this.sock;
+    if (!sock || this.state !== 'connected') return;
+    this.lidSyncTimer = setTimeout(() => {
+      this.lidSyncTimer = null;
+      void this.syncContactLids(sock);
+    }, delayMs);
+    this.lidSyncTimer.unref?.();
+  }
+
+  /**
+   * O WhatsApp passou a usar LIDs (identificadores internos) em muitas
+   * conversas. A agenda ainda guarda os contatos por telefone. O USync
+   * devolve o par telefone/LID e permite exibir o nome real no painel.
+   */
+  private async syncContactLids(sock: WASocket): Promise<void> {
+    if (this.lidSyncStarted) return;
+    this.lidSyncStarted = true;
+
+    const phones = this.store.getPhoneContactIds();
+    if (!phones.length) return;
+
+    let resolved = 0;
+    let checked = 0;
+    for (let index = 0; index < phones.length; index += 40) {
+      if (this.sock !== sock || this.state !== 'connected') {
+        this.lidSyncStarted = false;
+        return;
+      }
+      const batch = phones.slice(index, index + 40);
+      try {
+        const results = await sock.onWhatsApp(...batch);
+        checked += batch.length;
+        for (const item of results ?? []) {
+          const lid = typeof item?.lid === 'string' ? item.lid : '';
+          if (lid && item?.jid) {
+            this.store.linkLid(lid, item.jid);
+            resolved += 1;
+          }
+        }
+      } catch (error) {
+        console.warn('[whatsapp] não foi possível resolver LIDs da agenda:', error);
+      }
+      await sleep(400);
+    }
+
+    this.store.flush();
+    this.emitAllChats();
+    console.log(`[whatsapp] LIDs resolvidos: ${resolved} de ${checked} contatos da agenda`);
+  }
+
   private applyChat(chat: {
     id?: string | null;
     name?: string | null;
@@ -441,9 +529,18 @@ export class WhatsAppManager {
     conversationTimestamp?: unknown;
     pinned?: number | null;
     muteEndTime?: unknown;
+    pnJid?: string | null;
+    lidJid?: string | null;
   }): void {
     if (!chat.id) return;
     const isGroup = chat.id.endsWith('@g.us');
+    const lid = chat.id.endsWith('@lid') ? chat.id : chat.lidJid?.endsWith('@lid') ? chat.lidJid : undefined;
+    const phone = chat.pnJid?.endsWith('@s.whatsapp.net')
+      ? chat.pnJid
+      : chat.id.endsWith('@s.whatsapp.net')
+        ? chat.id
+        : undefined;
+    if (lid && phone) this.store.linkLid(lid, phone);
     const name = (chat.name || chat.subject || undefined) ?? undefined;
     const timestamp = chat.conversationTimestamp
       ? toMillis(chat.conversationTimestamp as WAMessage['messageTimestamp'])
@@ -495,13 +592,28 @@ export class WhatsAppManager {
     const kind = mediaKindFor(type);
     const mime = String(node?.mimetype ?? node?.mimeType ?? 'application/octet-stream');
     const fileName = node?.fileName ? String(node.fileName) : undefined;
+    const declaredSize = Number(node?.fileLength ?? 0);
+    const media: MediaInfo | undefined = kind
+      ? { kind, mime, fileName, size: declaredSize > 0 ? declaredSize : undefined }
+      : undefined;
+
+    const senderPhone = raw.key.senderPn ?? raw.key.participantPn;
+    const senderLid = raw.key.senderLid ?? raw.key.participantLid;
+    if (chatId.endsWith('@lid') && senderPhone) this.store.linkLid(chatId, senderPhone);
+    if (raw.key.participant?.endsWith('@lid') && raw.key.participantPn) {
+      this.store.linkLid(raw.key.participant, raw.key.participantPn);
+    }
+    if (senderLid?.endsWith('@lid') && senderPhone) this.store.linkLid(senderLid, senderPhone);
 
     if (!text && !kind) {
       return;
     }
 
     if (raw.pushName && !fromMe) {
-      this.store.upsertContact(chatId, { notify: raw.pushName });
+      const contactId = isGroup
+        ? senderPhone ?? raw.key.participant ?? chatId
+        : senderPhone ?? chatId;
+      this.store.upsertContact(contactId, { notify: raw.pushName });
     }
 
     const quotedNode = (node?.contextInfo as { quotedMessage?: proto.IMessage } | undefined)?.quotedMessage;
@@ -530,6 +642,7 @@ export class WhatsAppManager {
       text,
       timestamp,
       status: fromMe ? 'sent' : undefined,
+      media,
       quoted: quotedMessage
         ? {
             id: String((node?.contextInfo as { stanzaId?: string })?.stanzaId ?? ''),
@@ -644,22 +757,48 @@ export class WhatsAppManager {
       conversationTimestamp?: unknown;
       pinned?: number | null;
       muteEndTime?: unknown;
+      pnJid?: string | null;
+      lidJid?: string | null;
     }>;
-    contacts: Array<{ id?: string | null; name?: string | null; notify?: string | null }>;
+    contacts: Array<{
+      id?: string | null;
+      name?: string | null;
+      notify?: string | null;
+      lid?: string | null;
+      jid?: string | null;
+    }>;
     messages: WAMessage[];
     isLatest?: boolean;
   }): Promise<void> {
+    const sequence = ++this.syncSequence;
+    if (this.syncTimer) {
+      clearTimeout(this.syncTimer);
+      this.syncTimer = null;
+    }
+
     this.sync = { active: true, processed: 0 };
     this.emitStatus();
 
     try {
       for (const contact of payload.contacts) {
         if (!contact.id) continue;
-        this.store.upsertContact(contact.id, { name: contact.name ?? undefined, notify: contact.notify ?? undefined });
+        this.store.upsertContact(contact.id, {
+          name: contact.name ?? undefined,
+          notify: contact.notify ?? undefined,
+          lid: contact.lid ?? undefined,
+          jid: contact.jid ?? undefined,
+        });
       }
 
       for (const chat of payload.chats) {
         if (!chat.id) continue;
+        const lid = chat.id.endsWith('@lid') ? chat.id : chat.lidJid?.endsWith('@lid') ? chat.lidJid : undefined;
+        const phone = chat.pnJid?.endsWith('@s.whatsapp.net')
+          ? chat.pnJid
+          : chat.id.endsWith('@s.whatsapp.net')
+            ? chat.id
+            : undefined;
+        if (lid && phone) this.store.linkLid(lid, phone);
         const timestamp = chat.conversationTimestamp
           ? toMillis(chat.conversationTimestamp as WAMessage['messageTimestamp'])
           : 0;
@@ -690,13 +829,36 @@ export class WhatsAppManager {
         }
       }
 
+      if (sequence !== this.syncSequence) return;
+
       this.store.flush();
-      this.sync = { active: false, processed };
+      this.sync = { active: true, processed };
       this.emitStatus();
       this.emitAllChats();
-      bus.emit('sync-complete', { ok: true });
-      console.log(`[whatsapp] histórico sincronizado: ${processed} mensagens`);
+
+      const finish = () => {
+        if (sequence !== this.syncSequence) return;
+        if (this.syncTimer) {
+          clearTimeout(this.syncTimer);
+          this.syncTimer = null;
+        }
+        this.sync = { active: false, processed };
+        this.emitStatus();
+        this.scheduleLidSync(1000);
+        bus.emit('sync-complete', { ok: true });
+        console.log(`[whatsapp] histórico sincronizado: ${processed} mensagens`);
+      };
+
+      if (payload.isLatest) {
+        // O WhatsApp envia o histórico em vários lotes. Só o último deve
+        // disparar a recarga do painel, para não piscar a conversa aberta.
+        finish();
+      } else {
+        // Fallback para versões que não marcam isLatest em nenhum lote.
+        this.syncTimer = setTimeout(finish, 3500);
+      }
     } catch (error) {
+      if (sequence !== this.syncSequence) return;
       console.error('[whatsapp] erro na sincronização de histórico:', error);
       this.sync = null;
       this.emitStatus();

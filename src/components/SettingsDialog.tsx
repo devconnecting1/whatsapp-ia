@@ -24,7 +24,6 @@ import {
 } from '@/components/ui/dialog';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
-import { ScrollArea } from '@/components/ui/scroll-area';
 import { Separator } from '@/components/ui/separator';
 import { Switch } from '@/components/ui/switch';
 import { Textarea } from '@/components/ui/textarea';
@@ -148,6 +147,7 @@ export function SettingsDialog({
   const [testing, setTesting] = useState(false);
   const [testResult, setTestResult] = useState<{ reply: string; model: string; latencyMs: number } | null>(null);
   const wasOpenRef = useRef(false);
+  const scrollContainerRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     if (open && !wasOpenRef.current) {
@@ -226,21 +226,30 @@ export function SettingsDialog({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="flex max-h-[92vh] w-[calc(100vw-1.5rem)] max-w-3xl flex-col gap-0 overflow-hidden p-0">
-        <DialogHeader className="shrink-0 border-b px-5 py-4">
+      <DialogContent
+        className="flex max-h-[calc(100dvh-2rem)] w-[min(1120px,calc(100vw-2rem))] flex-col gap-0 overflow-hidden p-0"
+        onOpenAutoFocus={event => {
+          event.preventDefault();
+          const target = event.currentTarget as HTMLElement | null;
+          target?.focus({ preventScroll: true });
+          requestAnimationFrame(() => scrollContainerRef.current?.scrollTo({ top: 0 }));
+        }}
+      >
+        <DialogHeader className="flex shrink-0 flex-row flex-wrap items-center justify-between gap-x-6 gap-y-1 border-b px-5 py-4 pr-12 text-left">
           <DialogTitle className="flex items-center gap-2">
-            <Sparkles className="size-5 text-wa-teal" />
+            <Sparkles className="size-5 shrink-0 text-wa-teal" />
             Inteligência artificial
           </DialogTitle>
-          <DialogDescription>
+          <DialogDescription className="max-w-xl">
             Configure como a IA responde seus clientes no WhatsApp. As alterações valem para novas mensagens.
           </DialogDescription>
         </DialogHeader>
 
         {draft ? (
           <>
-            <ScrollArea className="min-h-0 flex-1">
-              <div className="space-y-4 px-4 py-4 sm:px-5">
+            <div ref={scrollContainerRef} className="min-h-0 flex-1 overflow-y-auto overflow-x-hidden">
+              <div className="grid items-start gap-4 p-4 sm:p-5 lg:grid-cols-2">
+                <div className="space-y-4">
                 <div
                   className={cn(
                     'flex items-start justify-between gap-4 rounded-xl border p-4',
@@ -402,7 +411,9 @@ export function SettingsDialog({
                     </Field>
                   </div>
                 </Section>
+                </div>
 
+                <div className="space-y-4">
                 <Section
                   icon={ShieldCheck}
                   title="Comportamento"
@@ -535,8 +546,9 @@ export function SettingsDialog({
                     </div>
                   )}
                 </div>
+                </div>
               </div>
-            </ScrollArea>
+            </div>
 
             <DialogFooter className="shrink-0 flex-row justify-end gap-2 border-t bg-white px-4 py-3 sm:px-5">
               <Button variant="outline" onClick={() => onOpenChange(false)} disabled={saving}>

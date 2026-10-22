@@ -1,4 +1,16 @@
-import { AlertCircle, Check, CheckCheck, Clock, Download, FileText, Sparkles } from 'lucide-react';
+import {
+  AlertCircle,
+  Check,
+  CheckCheck,
+  Clock,
+  Download,
+  FileText,
+  FileWarning,
+  ImageOff,
+  Mic,
+  Sparkles,
+  Video,
+} from 'lucide-react';
 import type { Message } from '@shared/types';
 import { formatFileSize, formatTime } from '@/lib/format';
 import { cn } from '@/lib/utils';
@@ -46,6 +58,39 @@ function StatusIcon({ message }: { message: Message }) {
 function MediaContent({ message }: { message: Message }) {
   const media = message.media;
   if (!media) return null;
+
+  if (!media.url) {
+    const Icon =
+      media.kind === 'audio'
+        ? Mic
+        : media.kind === 'video'
+          ? Video
+          : media.kind === 'image' || media.kind === 'sticker'
+            ? ImageOff
+            : FileText;
+    const label =
+      media.kind === 'audio'
+        ? 'Áudio não baixado'
+        : media.kind === 'video'
+          ? 'Vídeo não baixado'
+          : media.kind === 'image'
+            ? 'Imagem não baixada'
+            : media.kind === 'sticker'
+              ? 'Figurinha não baixada'
+              : media.fileName ?? 'Documento não baixado';
+
+    return (
+      <div className="flex items-center gap-2.5 rounded-md border border-dashed border-black/10 bg-black/[0.03] px-2.5 py-2">
+        <span className="grid size-9 shrink-0 place-items-center rounded-full bg-white/80 text-wa-subtle">
+          <Icon className="size-4" />
+        </span>
+        <span className="min-w-0 flex-1">
+          <span className="block truncate text-[13px] font-medium">{label}</span>
+          <span className="block text-[11px] text-wa-subtle">Disponível apenas no histórico do WhatsApp</span>
+        </span>
+      </div>
+    );
+  }
 
   if (media.kind === 'image' || media.kind === 'sticker') {
     return (
@@ -106,6 +151,7 @@ function MediaContent({ message }: { message: Message }) {
 export function MessageBubble({ message, isGroup }: MessageBubbleProps) {
   const showSender = isGroup && !message.fromMe && Boolean(message.senderName);
   const hasMedia = Boolean(message.media);
+  const hasContent = Boolean(message.text) || hasMedia;
 
   return (
     <div
@@ -145,10 +191,17 @@ export function MessageBubble({ message, isGroup }: MessageBubbleProps) {
           </p>
         )}
 
+        {!hasContent && (
+          <div className="flex items-center gap-2 rounded-md bg-black/[0.03] px-2 py-1.5 text-[12px] text-wa-subtle">
+            <FileWarning className="size-3.5 shrink-0" />
+            Mensagem não sincronizada
+          </div>
+        )}
+
         <div
           className={cn(
             'mt-0.5 flex items-center justify-end gap-1 pl-6 text-[10.5px] leading-none text-wa-subtle',
-            hasMedia && !message.text && 'absolute bottom-1.5 right-1.5 rounded-full bg-white/80 px-1.5 py-0.5',
+            hasMedia && !message.text && message.media?.url && 'absolute bottom-1.5 right-1.5 rounded-full bg-white/80 px-1.5 py-0.5',
           )}
         >
           {message.aiGenerated && (
